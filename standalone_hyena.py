@@ -119,9 +119,10 @@ class HyenaFilter(OptimModule):
             dropout=0.0, 
             w=1, # frequency of periodic activations 
             wd=0, # weight decay of kernel parameters 
-            bias=True,
+            use_bias=True,
             num_inner_mlps=2,
             normalized=False,
+            use_modulation=True,
             **kwargs
         ):
         """
@@ -135,9 +136,12 @@ class HyenaFilter(OptimModule):
         """
         super().__init__()
         self.d_model = d_model
-        self.use_bias = bias
+        self.use_bias = use_bias
         self.fused_fft_conv = fused_fft_conv
-        self.bias = nn.Parameter(torch.randn(self.d_model))
+        if use_bias:
+            self.bias = nn.Parameter(torch.randn(self.d_model))
+        else:
+            self.bias = torch.zeros(self.d_model)
         self.dropout = nn.Dropout(dropout)
         
         act = Sin(dim=order, w=w)
@@ -157,6 +161,7 @@ class HyenaFilter(OptimModule):
 
         self.implicit_filter.append(nn.Linear(order, d_model, bias=False))
             
+        self.use_modulation = use_modulation
         self.modulation = ExponentialModulation(d_model, **kwargs)
         
         self.normalized = normalized
@@ -168,7 +173,8 @@ class HyenaFilter(OptimModule):
     def filter(self, L, *args, **kwargs):
         z, t = self.pos_emb(L)
         h = self.implicit_filter(z)
-        h = self.modulation(t, h)
+        if self.use_modulation:
+            h = self.modulation(t, h)
         return h
 
     def forward(self, x, L, k=None, bias=None, *args, **kwargs):
@@ -186,6 +192,9 @@ class HyenaOperator(nn.Module):
             self,
             d_model,
             l_max,
+            d_context=None,
+            l_context_max=None,
+            use_context=False,
             order=2, 
             filter_order=64,
             dropout=0.0,  
@@ -210,7 +219,7 @@ class HyenaOperator(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.in_proj = nn.Linear(d_model, inner_width)
         self.out_proj = nn.Linear(d_model, d_model)
-        
+
         self.short_filter = nn.Conv1d(
             inner_width, 
             inner_width, 
@@ -225,9 +234,39 @@ class HyenaOperator(nn.Module):
             channels=1, 
             dropout=filter_dropout, 
             **filter_args
-        ) 
+        )
 
-    def forward(self, u, *args, **kwargs):
+
+        self.use_context = use_context
+        if use_context:
+            context_width = d_model * 2
+            self.d_context = d_context
+            self.context_proj = nn.Linear(d_context, context_width)
+            # self.context_to_model = nn.Linear(l_max, d_model)
+            self.l_context_max = l_context_max
+
+
+            self.context_short_filter = nn.Conv1d(
+                context_width,
+                context_width,
+                3,
+                padding=2,
+                groups=context_width
+            )
+            self.context_filter_fn = HyenaFilter(
+                d_model * 2,
+                order=filter_order,
+                seq_len=l_max,
+                channels=1,
+                dropout=filter_dropout,
+                use_modulation=False,
+                w=4
+                #**filter_args
+            )
+
+
+
+    def forward(self, u, in_context=None, *args, **kwargs):
         l = u.size(-2)
         l_filter = min(l, self.l_max)
         u = self.in_proj(u)
@@ -236,10 +275,38 @@ class HyenaOperator(nn.Module):
         uc = self.short_filter(u)[...,:l_filter] 
         *x, v = uc.split(self.d_model, dim=1)
         
-        k = self.filter_fn.filter(l_filter)[0]
+        k = self.filter_fn.filter(l_filter)[0] # 1x(oxd) -> (oxd)
         k = rearrange(k, 'l (o d) -> o d l', o=self.order - 1)
         bias = rearrange(self.filter_fn.bias, '(o d) -> o d', o=self.order - 1)
-        
+
+        # in_context -> Projection -> split -> filtering ->
+        if in_context is not None and self.use_context:
+            l_context = in_context.size(-2)
+            # l_context = min(l_context, self.l_context_max)
+            context = self.context_proj(in_context)
+            context = rearrange(context, 'b l d -> b d l')
+            if l_filter >= l_context:
+                context = nn.functional.pad(context, (0, l_filter-l_context), mode='reflect') # TODO: create different strategies for the context padding
+            else:
+                print('Warning: context length is greater than sequence length\n')
+
+            context_c = self.context_short_filter(context)[..., :l_filter]
+            c0, c1 = context_c.split(self.d_model, dim=1)
+
+            # DONE: TODO: instantiate filter with no modulation
+            k_context = self.context_filter_fn.filter(l_filter)[0]
+            k_context = rearrange(k_context, 'l (o d) -> o d l', o=2)
+            bias_context = rearrange(self.context_filter_fn.bias, '(o d) -> o d', o=2)
+
+            # DONE: TODO: append c0, c1 to x, k_context to k, bias_context to bias
+            x.append(c0)
+            x.append(c1)
+            k = torch.cat((k, k_context), dim=0)
+            bias = torch.cat((bias, bias_context), dim=0)
+            # x = [c0, c1] + x
+            # k = torch.cat((k_context, k), dim=0)
+            # bias = torch.cat((bias_context, bias), dim=0)
+
         for o, x_i in enumerate(reversed(x[1:])):
             v = self.dropout(v * x_i)
             v = self.filter_fn(v, l_filter, k=k[o], bias=bias[o])
@@ -249,20 +316,192 @@ class HyenaOperator(nn.Module):
         y = self.out_proj(y)
         return y
 
-    
-    
+
+class MyModel(nn.Module):
+    def __init__(self,
+                 d_model,
+                 l_max,
+                 order,
+                 filter_order,
+                 use_context,
+                 d_context,
+                 **filter_args
+                 ):
+        super(MyModel, self).__init__()
+        self.hyena = HyenaOperator(
+            d_model=d_model,
+            l_max=l_max,
+            order=order,
+            filter_order=filter_order,
+            use_context=use_context,
+            d_context=d_context,
+            **filter_args
+        )
+        self.fc = nn.Linear(d_model, d_context)
+
+    def forward(self, x, ctxt):
+        x = self.hyena(x, in_context=ctxt)
+        x = self.fc(x)
+        return x
+
+
+
+
+
 if __name__ == "__main__":
-    layer = HyenaOperator(
-        d_model=512, 
-        l_max=1024, 
-        order=2, 
-        filter_order=64
+    context_dim = 20
+    l_max = 10000
+    d_model = 20
+    dataset_len = 2000
+    use_context = True
+    num_epochs = 10
+    batch_size = 100
+    # if not use_context:
+    #     l_max *= 2
+
+    import random
+
+    def label_transform(label, length=l_max-10, context_dim=context_dim):
+
+        label = label.item()
+        res = []
+        for _ in range(length//3):
+            wis = random.randint(1, 5)
+            res += [label]
+            for s in range(wis):
+                res += [random.randint(0, context_dim-1)]
+            if len(res) > length - length//15:
+                res += [random.randint(0, context_dim-1) for _ in range(length-len(res))]
+                break
+        return res
+
+    def plot_kernel(model):
+        import matplotlib.pyplot as plt
+
+        k = model.hyena.filter_fn.filter(l_max)[0]  # 1x(oxd) -> (oxd)
+
+        k = rearrange(k, 'l (o d) -> o d l', o=model.hyena.order-1)
+        bias = rearrange(model.hyena.filter_fn.bias, '(o d) -> o d', o=model.hyena.order -1)
+        print(k.size(), bias.size())
+
+        _, idx = k.detach().std(dim=-1).max(dim=-1)
+        idx = idx[0].item()
+        print(idx)
+        for i in range(model.hyena.order -1):
+            plt.plot(range(l_max), k[i, idx].detach())# + bias[0, idx].detach())
+        #plt.plot(range(l_max), k[1, idx].detach())# + bias[1, idx].detach())
+        if model.hyena.use_context:
+            k_context = model.hyena.context_filter_fn.filter(l_max)[0]
+            k_context = rearrange(k_context, 'l (o d) -> o d l', o=2)
+            bias_context = rearrange(model.hyena.context_filter_fn.bias, '(o d) -> o d', o=2)
+            plt.plot(range(l_max), k_context[0, idx].detach())# + bias_context[0, idx].detach())
+            plt.plot(range(l_max), k_context[1, idx].detach())# + bias_context[1, idx].detach())
+        plt.show()
+
+
+    model = MyModel(
+        d_model=d_model,
+        l_max=l_max if use_context else l_max*2,
+        order=3,
+        filter_order=64,
+        use_context=use_context,
+        d_context=context_dim,
+        w=30,
+        emb_dim=33
     )
-    x = torch.randn(1, 1024, 512, requires_grad=True)
-    y = layer(x)
-        
-    print(x.shape, y.shape)
-    
-    grad = torch.autograd.grad(y[:, 10, :].sum(), x)[0]
-    print('Causality check: gradients should not flow "from future to past"')
-    print(grad[0, 11, :].sum(), grad[0, 9, :].sum())
+    # Define the loss function
+    criterion = nn.CrossEntropyLoss()
+
+    # Define the optimizer
+    learning_rate = 0.001
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.5)
+
+    # Train the model
+
+    sequences = [(2.0 + 5.0 * torch.randn((1, l_max, d_model), requires_grad=True)).softmax(dim=-1).detach() for _
+                 in range(dataset_len)]
+    # labels = [torch.randint(context_dim, (1)) for _ in range(dataset_len)]
+    labels = torch.randint(context_dim, (dataset_len,)).detach()
+    context = [torch.eye(context_dim)[label_transform(label)].unsqueeze(0).detach().requires_grad_() for label in
+               labels]
+    if not use_context:
+        sequences = [torch.cat((seq, cont), dim=1) for cont, seq in zip(context, sequences)]
+
+    for epoch in range(num_epochs):
+        if epoch%1==0:
+            plot_kernel(model)
+        running_loss = 0.0
+        correct = 0
+        total = 0
+
+
+
+        for i in range(0, len(sequences), batch_size):
+            # Get the current batch
+            inputs = sequences[i:i + batch_size]
+            x = torch.cat(inputs, dim=0)
+            ctxt = context[i:i + batch_size]
+            ctxt = torch.cat(ctxt, dim=0)
+            lbls = labels[i:i + batch_size]
+
+            # Zero the gradients
+            optimizer.zero_grad()
+
+            # Forward pass
+            outputs = model(x, ctxt)[:, -1, :]
+            #outputs = model(ctxt, x)[:, -1, :]
+            # print(outputs.size())
+            # print(outputs[:, -1, :].size())
+            loss = criterion(outputs, lbls)
+            running_loss += loss.item()
+
+            # Backward pass and optimization
+            loss.backward()
+            optimizer.step()
+            lr_scheduler.step()
+
+            # Compute accuracy
+            _, predicted = torch.max(outputs.data, 1)
+            total += lbls.size(0)
+            correct += (predicted == lbls).sum().item()
+
+            model.eval()
+            with torch.no_grad():
+
+                t_sequences = [(5.0 - 4.0 * torch.randn((1, l_max, d_model), requires_grad=True)).softmax(dim=-1) for _
+                               in
+                               range(100)]
+                # labels = [torch.randint(context_dim, (1)) for _ in range(dataset_len)]
+                t_labels = torch.randint(context_dim, (100,))
+
+                t_context = [torch.eye(context_dim)[label_transform(label)].unsqueeze(0).requires_grad_() for label in
+                             t_labels]
+
+                if not use_context:
+                    t_sequences = [torch.cat((seq, cont), dim=1) for cont, seq in zip(t_context, t_sequences)]
+
+                y_pred = torch.max(
+                    model(
+                        torch.cat(t_sequences, dim=0),
+                          torch.cat(t_context, dim=0)
+                          )[:, -1, :],
+                    dim=1
+                )[1]
+                t_correct = (y_pred == t_labels).sum().item()
+                print(f'after {i} sequences Acc: {t_correct/100 :.4f}')
+
+                #loss_val = criterion(y_pred_val.squeeze(), y_val.float())
+
+            model.train()
+
+        # Compute and print the epoch loss and accuracy
+        epoch_loss = running_loss / (len(sequences) / batch_size)
+        epoch_acc = correct / total
+        print(f"Epoch {epoch + 1}/{num_epochs}: Loss = {epoch_loss:.4f}, Accuracy = {epoch_acc:.4f}")
+
+    plot_kernel(model)
+
+
+
+
