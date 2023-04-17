@@ -18,6 +18,8 @@ try:
 except ImportError:
     FusedDense = None
 
+import sys
+sys.path.append('./')
 import src.utils.registry as registry
 from src.utils.train import OptimModule
 from src.utils.config import instantiate, auto_assign_attrs
@@ -86,50 +88,56 @@ class PositionalEmbedding(OptimModule):
         return self.z[:, :L], self.t[:, :L]
     
 
-class ExponentialModulation(OptimModule):
-    def __init__(
-        self,
-        d_model,
-        fast_decay_pct=0.3,
-        slow_decay_pct=1.5,
-        target=1e-2,
-        modulation_lr=0.0,
-        modulate: bool=True,
-        shift: float = 0.0,
-        **kwargs
-    ):
-        super().__init__()
-        self.modulate = modulate
-        self.shift = shift
-        max_decay = math.log(target) / fast_decay_pct
-        min_decay = math.log(target) / slow_decay_pct
-        deltas = torch.linspace(min_decay, max_decay, d_model)[None, None]
-        self.register("deltas", deltas, lr=modulation_lr)
-        
-    def forward(self, t, x):
-        if self.modulate:
-            decay = torch.exp(-t * self.deltas.abs()) 
-            x = x * (decay + self.shift)
-        return x
+# class ExponentialModulation(OptimModule):
+#     def __init__(
+#         self,
+#         d_model,
+#         fast_decay_pct=0.3,
+#         slow_decay_pct=1.5,
+#         target=1e-2,
+#         modulation_lr=0.0,
+#         modulate: bool=True,
+#         shift: float = 0.0,
+#         **kwargs
+#     ):
+#         super().__init__()
+#         self.modulate = modulate
+#         self.shift = shift
+#         max_decay = math.log(target) / fast_decay_pct
+#         min_decay = math.log(target) / slow_decay_pct
+#         deltas = torch.linspace(min_decay, max_decay, d_model)[None, None]
+#         self.register("deltas", deltas, lr=modulation_lr)
+#
+#     def forward(self, t, x):
+#         if self.modulate:
+#             decay = torch.exp(-t * self.deltas.abs())
+#             x = x * (decay + self.shift)
+#         return x
 
 class SolitonModulation(OptimModule):
     def __init__(
             self,
             d_model,
-            modulation_lr=0.001,
+            modulation_lr=1e-3,
             modulate: bool = True,
             shift: float = 0.0,
             amp=1.,
             width=1.,
             phase=0.,
+            num_peaks=2,
             **kwargs
     ):
         super().__init__()
         self.modulate = modulate
         self.shift = shift
-        self.amp = amp
-        self.width = width
-        self.phase = phase
+        # self.amp = amp
+        # self.width = width
+        # self.phase = phase
+        self.num_peaks = num_peaks
+
+        nn.init.normal_(amp, mean=1/(num_peaks-0.5), std=1/(num_peaks**0.5))
+        nn.init.normal_(width, mean=0.3/num_peaks, std=0.05/num_peaks)
+        nn.init.uniform_(phase)
 
         self.register("soliton_amplitude", amp, lr=modulation_lr)
         self.register("soliton_width", width, lr=modulation_lr)
@@ -138,18 +146,30 @@ class SolitonModulation(OptimModule):
 
     def forward(self, t, x):
         if self.modulate:
-            decay = squared_sech(t, self.amp, self.width, self.phase)
+
+            decay = torch.zeros(t.size(), requires_grad=True)
+            amp_s = torch.split(self.soliton_amplitude, 1, dim=0)
+            width_s = torch.split(self.soliton_width, 1, dim=0)
+            phase_s = torch.split(self.soliton_phase, 1, dim=0)
+            for i in range(self.soliton_phase.size(0)):
+
+                decay = decay + self.squared_sech(t, amp_s[i], width_s[i], phase_s[i])
+
             x = x * (decay+self.shift)
         return x
 
-    def squared_sech(x, amp, width, phase):
+    def squared_sech(self, x, amp, width, phase,):
         """
         Computes the square of the hyperbolic secant of a tensor x with 3 parameters.
         Analogue of the bump function
         """
+        num_peaks = self.num_peaks
+        # amp = rearrange(amp, '(p v)-> p v', p=num_peaks)
+        # width = rearrange(width, '(p v)-> p v', p=num_peaks)
+        # phase = rearrange(phase, '(p v)-> p v', p=num_peaks)
         cosh = torch.cosh(torch.reciprocal(width) * (x - phase))
         sech = torch.reciprocal(cosh)
-        return amp * torch.pow(sech, 2)
+        return (amp * torch.pow(sech, 2))
 
 
 class HyenaFilter(OptimModule):
@@ -208,12 +228,18 @@ class HyenaFilter(OptimModule):
         # final linear layer
         self.implicit_filter.append(nn.Linear(order, d_model, bias=False))
             
-        self.modulation = []
-        for i in range(modulation_peaks):
-            amp = 1. + torch.randn((d_model,)) / (2*modulation_peaks)
-            width = 1. / modulation_peaks * torch.randn((d_model,)) ,
-            phase = (i+0.5) / modulation_peaks + torch.randn((d_model,)) / (2*modulation_peaks),
-            self.modulation.append(SolitonModulation(d_model), amp=amp, width=width, phase=phase)
+        self.modulation = nn.ModuleList([])
+        for i in range(1):
+            print('PEAKS:', modulation_peaks)
+            self.modulation.append(SolitonModulation(d_model,
+                                                     amp=torch.empty((modulation_peaks, d_model,)),
+                                                     width=torch.empty((modulation_peaks, d_model,)),
+                                                     phase=torch.empty((modulation_peaks, d_model,)),
+                                                     )
+                                   )
+                                                     # amp=(1. + 1/modulation_peaks * torch.randn((modulation_peaks, d_model,), requires_grad=True) / (d_model*modulation_peaks)).detach(),
+                                                     # width=(0.5 / (modulation_peaks) * torch.randn((modulation_peaks,d_model,), requires_grad=True)).detach(),
+                                                     # phase=((torch.linspace(0.5/(modulation_peaks+1), ((modulation_peaks+0.5)/(modulation_peaks+1)), steps=modulation_peaks)[:, None])  + torch.randn((modulation_peaks, d_model,), requires_grad=True) / (d_model*modulation_peaks)).detach())
         
         self.normalized = normalized
         for c in self.implicit_filter.children():
@@ -226,7 +252,7 @@ class HyenaFilter(OptimModule):
         h = self.implicit_filter(z)
 
         for modulation in self.modulation:
-            h += modulation(t, h)
+            h = modulation(t, h)
 
         if self.normalized: h = h / torch.norm(h, dim=-1, p=1, keepdim=True)
 
@@ -266,7 +292,7 @@ class HyenaOperator(nn.Module):
             outer_mixing=False,
             dropout=0.0,  
             filter_dropout=0.0, 
-            filter_cls='hyena-filter',
+            filter_cls='hyena-filter-2peaks',
             post_order_ffn=False,
             jit_filter=False, 
             short_filter_order=3, 
@@ -299,7 +325,7 @@ class HyenaOperator(nn.Module):
         assert l_max % num_blocks == 0, f'Maximum signal length {l_max} must be divisible by block dimension {num_blocks}'
         block_dim = l_max // num_blocks
         head_dim = d_model // num_heads
-        
+
         auto_assign_attrs(
             self, d_model=d_model, order=order, l_max=l_max, num_heads=num_heads, inner_factor=inner_factor, 
             block_dim=block_dim, head_dim=head_dim, filter_order=filter_order, post_order_ffn=post_order_ffn,
@@ -339,11 +365,12 @@ class HyenaOperator(nn.Module):
         filter_cls = instantiate(registry.layer, filter_cls, partial=True)
                     
         self.filter_fn = filter_cls(
-            self.head_dim * self.inner_factor * (self.order - 1), 
+            self.head_dim * self.inner_factor * (self.order - 1),
             order=self.filter_order, 
             seq_len=self.l_max,
             channels=1, 
-            dropout=self.filter_dropout, 
+            dropout=self.filter_dropout,
+            #modulation_peaks=2, #* self.inner_factor * (self.order - 1),
             **filter_args
         ) 
         if self.jit_filter: self.filter_fn = torch.jit.script(self.filter_fn, self.L)
@@ -403,3 +430,243 @@ class HyenaOperator(nn.Module):
     @property
     def d_output(self):
         return self.d_model
+
+
+#
+# class MyModel(nn.Module):
+#     def __init__(self,
+#                  d_model,
+#                  l_max,
+#                  order,
+#                  filter_order,
+#                  # use_context,
+#                  # d_context,
+#                  **filter_args
+#                  ):
+#         super(MyModel, self).__init__()
+#         self.hyena = HyenaOperator(
+#             d_model=d_model,
+#             l_max=l_max,
+#             order=order,
+#             filter_order=filter_order,
+#             # use_context=use_context,
+#             # d_context=d_context,
+#             **filter_args
+#         )
+#         # self.hyena_2 = HyenaOperator(
+#         #     d_model=d_model,
+#         #     l_max=l_max,
+#         #     order=order,
+#         #     filter_order=filter_order,
+#         #     # use_context=True,
+#         #     # d_context=d_context,
+#         #     **filter_args
+#         # )
+#         # self.fc = nn.Linear(d_model, d_context)
+#
+#     def forward(self, x):
+#         x = self.hyena(x)
+#         # x = self.hyena_2(x)
+#         # x, ctxt = x['seq'], x['context']
+#         # x = self.hyena_2(x)
+#
+#         # x = self.fc(x)
+#         return x
+#
+#
+# if __name__ == "__main__":
+#     context_dim = 20
+#     l_max = 200
+#     d_model = 20
+#     dataset_len = 10000
+#     use_context = False
+#     num_epochs = 10
+#     batch_size = 500
+#     # if not use_context:
+#     #     l_max *= 2
+#
+#     import random
+#
+#     def label_transform(label, length=l_max-10, context_dim=context_dim):
+#
+#         label = label.item()
+#         res = []
+#         for i in range(length):
+#             if 7*length/10 < i and i < 8*length/10:
+#                 res.append(label)
+#             else:
+#                 res.append(random.randint(0, context_dim-1))
+#
+#         # for _ in range(length//2):
+#         #     wis = random.randint(0, 5)
+#         #     res += [label]
+#         #     for s in range(wis):
+#         #         res += [random.randint(0, context_dim-1)]
+#         #     if len(res) > length - length//15:
+#         #         res += [random.randint(0, context_dim-1) for _ in range(length-len(res))]
+#         #         break
+#         return res
+#
+#     def plot_kernel(model):
+#         import matplotlib.pyplot as plt
+#
+#         k = model.hyena.filter_fn.filter(l_max*2)[0]  # 1x(oxd) -> (oxd)
+#
+#         k = rearrange(k, 'l (d o) -> o d l', o=model.hyena.order-1)
+#         bias = rearrange(model.hyena.filter_fn.bias, '(d o) -> o d', o=model.hyena.order -1)
+#         # print(k.size(), bias.size())
+#
+#         _, idx = k.detach().std(dim=-1).max(dim=-1)
+#         idx = idx[0].item()
+#         # print(idx, k.size())
+#         for i in range(model.hyena.order -1):
+#             plt.plot(range(l_max*2), k[i, idx].detach())# + bias[0, idx].detach())
+#         #plt.plot(range(l_max), k[1, idx].detach())# + bias[1, idx].detach())
+#         if use_context:
+#             k_context = model.hyena.context_filter_fn.filter(l_max*2)[0]
+#             k_context = rearrange(k_context, 'l (o d) -> o d l', o=2)
+#             bias_context = rearrange(model.hyena.context_filter_fn.bias, '(o d) -> o d', o=2)
+#             plt.plot(range(l_max*2), k_context[0, idx].detach())# + bias_context[0, idx].detach())
+#             plt.plot(range(l_max*2), k_context[1, idx].detach())# + bias_context[1, idx].detach())
+#
+#         t = torch.linspace(0, 1, l_max*2)[None, :, None]
+#         m = torch.zeros(( l_max*2, (model.hyena.order-1)*d_model))[None, :, :]
+#         ones = 1. + torch.zeros((l_max*2, (model.hyena.order-1)*d_model))[None, :, :]
+#         for modulation in model.hyena.filter_fn.modulation:
+#
+#             m += modulation(t, ones)
+#         m = rearrange(m, 'n l (d o) -> n l o d', o=model.hyena.order-1)
+#         for m_i in range(model.hyena.order-1):
+#             m_p = m[0,:, m_i, idx]
+#             plt.plot(range(l_max*2), m_p.detach())
+#         plt.show()
+#
+#
+#     model = MyModel(
+#         d_model=d_model,
+#         l_max=l_max if use_context else l_max*2,
+#         order=3,
+#         filter_order=16,
+#         # use_context=use_context,
+#         # d_context=context_dim,
+#         w=10,
+#         emb_dim=3,
+#         modulation_peaks=2,
+#     )
+#     # Define the loss function
+#     criterion = nn.CrossEntropyLoss()
+#
+#     # torch.autograd.set_detect_anomaly(True)
+#     # Define the optimizer
+#     learning_rate = 0.001
+#     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+#     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
+#
+#     # Train the model
+#
+#     sequences = [(2.0 + 5.0 * torch.randn((1, l_max, d_model), requires_grad=True)).softmax(dim=-1).detach() for _
+#                  in range(dataset_len)]
+#     # labels = [torch.randint(context_dim, (1)) for _ in range(dataset_len)]
+#     labels = torch.randint(context_dim, (dataset_len,)).detach()
+#     context = [torch.eye(context_dim)[label_transform(label)].unsqueeze(0).detach().requires_grad_() for label in
+#                labels]
+#     if not use_context:
+#         sequences = [torch.cat((seq, cont), dim=1) for cont, seq in zip(context, sequences)]
+#
+#     for name, param in model.named_parameters():
+#         print(name, param.shape, getattr(param, "_optim", {}), param.requires_grad, isinstance(param, torch.nn.Parameter))
+#
+#     for epoch in range(num_epochs):
+#         if epoch%1==0:
+#             plot_kernel(model)
+#         running_loss = 0.0
+#         correct = 0
+#         total = 0
+#
+#         print(
+#             f'Mean of modulation params: amp:', model.hyena.filter_fn.modulation[0].soliton_amplitude.detach().mean(),
+#             f'width:', model.hyena.filter_fn.modulation[0].soliton_width.detach().mean(),
+#             f'phase:', model.hyena.filter_fn.modulation[0].soliton_phase.detach().mean(),
+#             'kerel:', model.hyena.filter_fn.implicit_filter[0].weight.detach().mean(),
+#         )
+#
+#         for i in range(0, len(sequences), batch_size):
+#
+#             # Get the current batch
+#             inputs = sequences[i:i + batch_size]
+#             x = torch.cat(inputs, dim=0)
+#             ctxt = context[i:i + batch_size]
+#             ctxt = torch.cat(ctxt, dim=0)
+#             lbls = labels[i:i + batch_size]
+#
+#             # x = {'seq': x, 'context': ctxt}
+#
+#             # Zero the gradients
+#             optimizer.zero_grad()
+#
+#             # Forward pass
+#             outputs = model(x)[:, -1, :]
+#             #outputs = model(ctxt, x)[:, -1, :]
+#             # print(outputs.size())
+#             # print(outputs[:, -1, :].size())
+#             loss = criterion(outputs, lbls)
+#             running_loss += loss.item()
+#
+#             # Backward pass and optimization
+#             loss.backward()
+#             optimizer.step()
+#
+#
+#             # Compute accuracy
+#             _, predicted = torch.max(outputs.data, 1)
+#             total += lbls.size(0)
+#             correct += (predicted == lbls).sum().item()
+#             if i%1000==0:
+#                 model.eval()
+#                 with torch.no_grad():
+#
+#                     t_sequences = [(5.0 - 4.0 * torch.randn((1, l_max, d_model), requires_grad=True)).softmax(dim=-1) for _
+#                                    in
+#                                    range(100)]
+#                     # labels = [torch.randint(context_dim, (1)) for _ in range(dataset_len)]
+#                     t_labels = torch.randint(context_dim, (100,))
+#
+#                     t_context = [torch.eye(context_dim)[label_transform(label)].unsqueeze(0).requires_grad_() for label in
+#                                  t_labels]
+#
+#                     if not use_context:
+#                         t_sequences = [torch.cat((seq, cont), dim=1) for cont, seq in zip(t_context, t_sequences)]
+#
+#                     y_pred = model(
+#                             torch.cat(t_sequences, dim=0),
+#                               )[:, -1, :]
+#
+#                     t_loss = criterion(y_pred, t_labels)
+#                     y_pred = torch.max(
+#                         y_pred,
+#                         dim=1
+#                     )[1]
+#                     t_correct = (y_pred == t_labels).sum().item()
+#                     print(f'after {i} sequences Acc: {t_correct/100 :.4f} Loss:{t_loss.item() :.4f}')
+#
+#
+#                     #loss_val = criterion(y_pred_val.squeeze(), y_val.float())
+#
+#                 model.train()
+#
+#                 print(
+#                     f'Mean of modulation params: amp:', model.hyena.filter_fn.modulation[0].soliton_amplitude[0,0],
+#                     f'width:', model.hyena.filter_fn.modulation[0].soliton_width[0,0],
+#                     f'phase:', model.hyena.filter_fn.modulation[0].soliton_phase[0,0],
+#                     'kerel:', model.hyena.filter_fn.implicit_filter[0].weight[0,0],
+#                     )
+#
+#         # Compute and print the epoch loss and accuracy
+#         epoch_loss = running_loss / (len(sequences) / batch_size)
+#         epoch_acc = correct / total
+#         print(f"Epoch {epoch + 1}/{num_epochs}: Loss = {epoch_loss:.4f}, Accuracy = {epoch_acc:.4f}")
+#         lr_scheduler.step()
+#
+#     plot_kernel(model)
+#
+#
