@@ -2,7 +2,7 @@ Configs for various experiments.
 
 Adding `wandb=null` to any command line turns off logging.
 
-Some of these datasets may require downloading and preparing data, documented in the [src/dataloaders](./src/dataloaders/) subdirectory.
+Some of these datasets may require downloading and preparing data, documented in the [src/dataloaders](src_fl/dataloaders/) subdirectory.
 
 ## Long Range Arena (LRA)
 
